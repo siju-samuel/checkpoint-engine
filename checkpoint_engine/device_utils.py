@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import os
 import re
 import socket
@@ -209,9 +210,20 @@ class DeviceManager:
         except ImportError:
             return False
 
+    def _is_torch_xpu_available(self) -> bool:
+        try:
+            if hasattr(torch, "xpu") and callable(getattr(torch.xpu, "is_available", None)):
+                return torch.xpu.is_available()
+            else:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+
     def _detect_device_type(self) -> str:
         if self._is_torch_npu_available():
             return "npu"
+        elif self._is_torch_xpu_available():
+            return "xpu"
         elif torch.cuda.is_available():
             return "cuda"
         else:
@@ -222,6 +234,8 @@ class DeviceManager:
             import torch_npu
 
             self.device_module = torch_npu.npu
+        elif self.device_type == "xpu":
+            self.device_module = torch.xpu
         elif self.device_type == "cuda":
             self.device_module = torch.cuda
         else:
@@ -231,6 +245,8 @@ class DeviceManager:
     def backend(self) -> str:
         if self.device_type == "npu":
             return "hccl"
+        elif self.device_type == "xpu":
+            return "xccl"
         elif self.device_type == "cuda":
             return "nccl"
         else:
@@ -240,7 +256,7 @@ class DeviceManager:
     def transfer_engine_protocol(self) -> str:
         if self.device_type == "npu":
             return "ascend_direct"
-        elif self.device_type == "cuda":
+        elif self.device_type in ("cuda", "xpu"):
             if has_efa_pci():
                 return "efa"
             else:
@@ -255,3 +271,38 @@ class DeviceManager:
             return _get_my_rdma_device(rank, self.device_module.device_count(), _get_rdma_devices())
         else:
             raise TypeError("The current transfer engine protocol is not supported")
+
+    def ipc_collect(self) -> None:
+        """Reclaim memory held by stale IPC handles where the backend supports it (no-op otherwise)."""
+        fn = getattr(self.device_module, "ipc_collect", None)
+        if callable(fn):
+            fn()
+
+    def supports_inplace_pin(self) -> bool:
+        """Whether in-place host-memory pinning (cudaHostRegister) is available -- CUDA only."""
+        return self.device_type == "cuda"
+
+    def supports_device_ipc(self) -> bool:
+        """Whether cross-process IPC of *device* tensors works for this backend.
+
+        CUDA/NPU use ``torch.multiprocessing.reductions``; XPU uses the native SYCL
+        ``ipc_memory`` extension, available when it can be built (oneAPI >= 2026.0).
+        """
+        if self.device_type in ("cuda", "npu"):
+            return True
+        if self.device_type == "xpu":
+            from checkpoint_engine import xpu_ipc
+
+            return xpu_ipc.is_available()
+        return False
+
+    def supports_device_p2p(self) -> bool:
+        """Whether P2P (Mooncake) transfer of *device* memory works for this backend (CUDA/NPU only)."""
+        return self.device_type in ("cuda", "npu")
+
+    def host_empty_cache(self) -> None:
+        """Release cached pinned host memory (``_host_emptyCache`` on CUDA; else ``gc.collect``)."""
+        if self.device_type == "cuda":
+            torch._C._host_emptyCache()
+        else:
+            gc.collect()

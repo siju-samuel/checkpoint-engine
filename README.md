@@ -75,6 +75,28 @@ Use the flexible P2P implementation, notice this will install `mooncake-transfer
 pip install 'checkpoint-engine[p2p]'
 ```
 
+### Intel XPU (build from source)
+
+Intel XPU is supported for the **broadcast** update path. The cross-process weight handoff uses a native SYCL `ipc_memory` extension (the XPU counterpart of CUDA IPC) that is JIT-compiled at runtime. Install from source since XPU support is not yet in the released package. P2P is not supported on XPU (Mooncake has no Level Zero backend for XPU device memory).
+
+Requirements:
+- Intel XPU build of PyTorch — `torch.xpu.is_available()` returns `True`, `torch>=2.9` (for the device `.uuid` property). See the [PyTorch XPU install guide](https://pytorch.org/docs/stable/notes/get_start_xpu.html); this is not the default PyPI `torch`.
+- Intel oneAPI 2026.0+ providing the `icpx` compiler with SYCL `ipc_memory` support. Needed at runtime (first weight update), not at `pip install` time.
+
+```Bash
+git clone https://github.com/MoonshotAI/checkpoint-engine.git
+cd checkpoint-engine
+pip install -e .    # no [p2p] extra on XPU
+```
+
+Make `icpx` discoverable in the runtime environment, either by sourcing oneAPI (`source /opt/intel/oneapi/setvars.sh`) or by setting `CMPLR_ROOT`. If neither is set, `icpx` is auto-detected under `/opt/intel/oneapi/compiler/*/bin`. The extension then builds automatically on first use; `ParameterServer` also prebuilds it at startup so the one-time compile stays out of the update window.
+
+Verify the build and the IPC path on the target machine:
+
+```Bash
+pytest tests/test_xpu_ipc.py    # hardware-gated; skipped without an Intel GPU + buildable extension
+```
+
 ## Getting Started
 
 Prepare an H800 or H20 machine with 8 GPUs with vLLM. Be sure to include [/collective_rpc API endpoint](https://github.com/vllm-project/vllm/commit/f7cf5b512ee41f36613deb2471a44de5f304f70d) commit (available in main branch) since checkpoint-engine will use this endpoint to update weights. vLLM version `v0.10.2` is fully tested and recommended.

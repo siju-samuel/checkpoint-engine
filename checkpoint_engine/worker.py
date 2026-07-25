@@ -8,20 +8,24 @@ import torch
 import zmq
 
 from checkpoint_engine.device_utils import DeviceManager, npu_generate_uuid
+from checkpoint_engine.transport import (
+    IpcWeightTransport,
+    WeightTransport,
+    XpuIpcWeightTransport,
+)
 
 
 _WEIGHTS_TYPE = list[tuple[str, torch.Tensor]]
 
 
-def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
-    func, args = handle
-    list_args = list(args)
-    if device_id is not None:
-        # the key is to change device id to the current device id
-        # in case two processes have different CUDA_VISIBLE_DEVICES
-        list_args[6] = device_id
-    buffer = func(*list_args)
-    return buffer
+def _transport_for_handle(handle: object) -> WeightTransport:
+    """Pick the consumer-side transport based on the handle wire format.
+
+    CUDA/NPU send a ``reduce_tensor`` tuple; XPU sends a dict tagged with its kind.
+    """
+    if isinstance(handle, dict) and handle.get("kind") == XpuIpcWeightTransport.kind:
+        return XpuIpcWeightTransport()
+    return IpcWeightTransport()
 
 
 class FlattenedTensorMetadata(TypedDict):
@@ -59,10 +63,11 @@ def update_weights_from_ipc(
     socket.connect(zmq_handle)
     buffer: torch.Tensor | None = None
     device_manager = DeviceManager()
+    transport: WeightTransport | None = None
     try:
-        ipc_handle: tuple[Callable, tuple] = socket.recv_pyobj()
-        assert isinstance(ipc_handle, tuple)
-        buffer = _rebuild_ipc(ipc_handle, device_id)
+        ipc_handle = socket.recv_pyobj()
+        transport = _transport_for_handle(ipc_handle)
+        buffer = transport.attach(ipc_handle, device_id)
         assert buffer.dtype == torch.uint8
         socket.send(b"")
     except Exception as e:
@@ -91,10 +96,11 @@ def update_weights_from_ipc(
                 device_manager.device_module.synchronize()
                 released = True
                 buffer = None
-                del ipc_handle
+                if transport is not None:
+                    transport.detach()
 
                 gc.collect()
-                device_manager.device_module.ipc_collect()
+                device_manager.ipc_collect()
                 device_manager.device_module.empty_cache()
                 device_manager.device_module.synchronize()
                 socket.send(b"")
@@ -119,6 +125,8 @@ def update_weights_from_ipc(
     finally:
         socket.close()
         del buffer
+        if transport is not None:
+            transport.detach()
         gc.collect()
         device_manager.device_module.empty_cache()
 
@@ -147,6 +155,9 @@ class VllmColocateWorkerExtension:
             return current_platform.get_device_uuid(self.device.index)
         elif current_platform.device_type == "npu":
             return f"NPU-{npu_generate_uuid()}"
+        elif current_platform.device_type == "xpu":
+            # Must match ps.py::_get_physical_gpu_id ("GPU-<uuid>") for the ZMQ key to resolve.
+            return f"GPU-{torch.xpu.get_device_properties(self.device.index).uuid!s}"
         else:
             raise ValueError(f"Unsupported device type: {current_platform.device_type}")
 
@@ -170,9 +181,10 @@ class VllmColocateWorkerExtension:
                         The device UUID is platform-specific:
                         - For CUDA: UUID from `current_platform.get_device_uuid()`
                         - For NPU: Format "NPU-{generated_uuid}"
+                        - For XPU: Format "GPU-{torch.xpu device uuid}"
 
         Raises:
-            ValueError: If the device type is not supported (not CUDA or NPU).
+            ValueError: If the device type is not supported (not CUDA, NPU, or XPU).
             AssertionError: If the device is not properly initialized.
 
         Note:
@@ -185,6 +197,8 @@ class VllmColocateWorkerExtension:
         # vllm-ascend not init device
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
+        elif current_platform.device_type == "xpu" and self.device is None:
+            self.device = torch.device(f"xpu:{self.local_rank}")
         assert self.device is not None
 
         def _load_weights(weights: _WEIGHTS_TYPE):

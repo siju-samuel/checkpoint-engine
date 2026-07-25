@@ -28,7 +28,11 @@ requires = ["setuptools", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["checkpoint_engine"]
+include = ["checkpoint_engine", "checkpoint_engine.*"]
+
+[tool.setuptools.package-data]
+# Ship the SYCL ipc_memory source; it is JIT-compiled at runtime on XPU hosts.
+"checkpoint_engine.xpu_ipc" = ["*.cpp"]
 
 [tool.setuptools_scm]
 version_file = "checkpoint_engine/_version.py"

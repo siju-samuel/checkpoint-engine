@@ -229,7 +229,12 @@ def use_backend(backend: str | None):
         "vllm_hccl": ".vllm_hccl.DistributedHccl",
     }
     if backend not in mapping:
-        raise ValueError(f"Unsupported custom backend: {backend}")
+        # XPU has no custom backend; leave custom_dist unset to use the default xccl TorchBackend.
+        raise ValueError(
+            f"Unsupported custom backend: {backend}. "
+            f"Supported custom backends: {sorted(mapping)}. "
+            "XPU is not supported here; leave custom_dist unset to use the default xccl backend."
+        )
 
     module_path, class_name = mapping[backend].rsplit(".", 1)
     module = importlib.import_module(module_path, "checkpoint_engine.distributed")
