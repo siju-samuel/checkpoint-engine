@@ -6,7 +6,7 @@ CPU-only: we stub the ParameterServer internals up to the guard.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,17 +29,34 @@ def _ps_with_device(device_type: str, *, supports_ipc: bool, supports_p2p: bool)
 
 def test_p2p_update_rejected_on_xpu():
     ps = _ps_with_device("xpu", supports_ipc=True, supports_p2p=False)
+    ipc_handler = MagicMock()
     with (
         patch.object(dist, "is_initialized", return_value=True),
         pytest.raises(RuntimeError, match=r"P2P weight update .* is not supported"),
     ):
-        ps._update_per_bucket("ckpt", req_func=lambda _paths: None, ranks_group=None, ranks=[0])
+        ps._update_per_bucket(
+            "ckpt",
+            req_func=lambda _paths: None,
+            ipc_handler=ipc_handler,
+            ranks_group=None,
+            ranks=[0],
+        )
+    # The guard must fire before any handle is exported.
+    ipc_handler.export.assert_not_called()
 
 
 def test_ipc_unavailable_rejected():
     ps = _ps_with_device("xpu", supports_ipc=False, supports_p2p=False)
+    ipc_handler = MagicMock()
     with (
         patch.object(dist, "is_initialized", return_value=True),
         pytest.raises(RuntimeError, match="cross-process device-tensor IPC"),
     ):
-        ps._update_per_bucket("ckpt", req_func=lambda _paths: None, ranks_group=None, ranks=None)
+        ps._update_per_bucket(
+            "ckpt",
+            req_func=lambda _paths: None,
+            ipc_handler=ipc_handler,
+            ranks_group=None,
+            ranks=None,
+        )
+    ipc_handler.export.assert_not_called()

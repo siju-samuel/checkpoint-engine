@@ -80,8 +80,8 @@ pip install 'checkpoint-engine[p2p]'
 Intel XPU is supported for the **broadcast** update path. The cross-process weight handoff uses a native SYCL `ipc_memory` extension (the XPU counterpart of CUDA IPC) that is JIT-compiled at runtime. Install from source since XPU support is not yet in the released package. P2P is not supported on XPU (Mooncake has no Level Zero backend for XPU device memory).
 
 Requirements:
-- Intel XPU build of PyTorch — `torch.xpu.is_available()` returns `True`, `torch>=2.9` (for the device `.uuid` property). See the [PyTorch XPU install guide](https://pytorch.org/docs/stable/notes/get_start_xpu.html); this is not the default PyPI `torch`.
-- Intel oneAPI 2026.0+ providing the `icpx` compiler with SYCL `ipc_memory` support. Needed at runtime (first weight update), not at `pip install` time.
+- Intel XPU build of PyTorch — `torch.xpu.is_available()` returns `True`, `torch>=2.9` (for the device `.uuid` property; the SYCL extension build also needs `torch>=2.7`). See the [PyTorch XPU install guide](https://pytorch.org/docs/stable/notes/get_start_xpu.html); this is not the default PyPI `torch`.
+- Intel oneAPI 2026.0+ providing the `icpx` compiler with SYCL IPC memory support. Needed at runtime (first weight update), not at `pip install` time.
 
 ```Bash
 git clone https://github.com/MoonshotAI/checkpoint-engine.git
@@ -89,7 +89,7 @@ cd checkpoint-engine
 pip install -e .    # no [p2p] extra on XPU
 ```
 
-Make `icpx` discoverable in the runtime environment, either by sourcing oneAPI (`source /opt/intel/oneapi/setvars.sh`) or by setting `CMPLR_ROOT`. If neither is set, `icpx` is auto-detected under `/opt/intel/oneapi/compiler/*/bin`. The extension then builds automatically on first use; `ParameterServer` also prebuilds it at startup so the one-time compile stays out of the update window.
+Make `icpx` discoverable in the runtime environment, either by sourcing oneAPI (`source /opt/intel/oneapi/setvars.sh`) or by setting `CMPLR_ROOT`. If neither is set, `icpx` is auto-detected under `/opt/intel/oneapi/compiler/*/bin` and then on `PATH`. The extension then builds automatically on first use; `ParameterServer` also prebuilds it at startup so the one-time compile stays out of the update window.
 
 Verify the build and the IPC path on the target machine:
 

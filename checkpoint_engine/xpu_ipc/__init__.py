@@ -1,13 +1,11 @@
-"""Cross-process device-buffer IPC for Intel XPU via SYCL ``ipc_memory``.
+"""Cross-process device-buffer IPC for Intel XPU via SYCL IPC memory.
 
-``sycl_ipc.cpp`` wraps ``ipc_memory`` (``get``/``open``/``close``), exported by
-torch's own libsycl (oneAPI >= 2026.0); this module JIT-compiles it with
-``-fsycl``. The handle is a self-contained portable byte blob (no dma-buf fd, no
-offset to carry), so it rides the existing ZMQ channel like CUDA's
-``reduce_tensor`` tuple -- see ``XpuIpcWeightTransport``.
+``sycl_ipc.cpp`` wraps the SYCL IPC memory API (``get``/``open``/``close``),
+exported by torch's own libsycl (oneAPI >= 2026.0); this module JIT-compiles it
+with ``with_sycl``. The handle is a self-contained portable byte blob (no dma-buf
+fd, no offset to carry), so it rides the existing ZMQ channel like CUDA's
+``reduce_tensor`` tuple -- see ``XpuIPCHandler``.
 """
-
-from __future__ import annotations
 
 import functools
 import glob
@@ -25,85 +23,85 @@ if TYPE_CHECKING:
     import torch
 
 
-def _find_sycl_include_dir() -> str | None:
-    """Locate a directory containing <sycl/ext/oneapi/experimental/ipc_memory.hpp>."""
-    candidates: list[str] = []
-    root = os.getenv("CMPLR_ROOT")
-    if root:
-        candidates.append(os.path.join(root, "include"))
-    # Common oneAPI install layouts (versioned + `latest` symlink).
-    candidates += sorted(glob.glob("/opt/intel/oneapi/compiler/*/include"), reverse=True)
-    # Derive from the discovered compiler (<root>/bin/icpx -> <root>/include), which
-    # covers a PATH-only icpx whose oneAPI root is outside /opt.
-    icpx = _find_icpx()
-    if icpx:
-        candidates.append(os.path.join(os.path.dirname(os.path.dirname(icpx)), "include"))
-    for inc in candidates:
-        if os.path.exists(
-            os.path.join(inc, "sycl", "ext", "oneapi", "experimental", "ipc_memory.hpp")
-        ):
-            return inc
-    return None
+def _has_ipc_memory(icpx: str) -> bool:
+    """Whether this icpx ships the SYCL IPC memory header (oneAPI >= 2026.0)."""
+    root = os.path.dirname(os.path.dirname(icpx))
+    header = os.path.join(
+        root, "include", "sycl", "ext", "oneapi", "experimental", "ipc_memory.hpp"
+    )
+    return os.path.exists(header)
+
+
+def _icpx_version_key(path: str) -> tuple[int, list[int]]:
+    """Sort key for ``.../compiler/<ver>/bin/icpx``: numeric parts, so 2026.10 > 2026.9.
+
+    The non-numeric ``latest`` symlink sorts first (it points at the newest install).
+    """
+    version = path.split("/")[-3]
+    parts = version.split(".")
+    if not all(p.isdigit() for p in parts):
+        return (1, [])
+    return (0, [int(p) for p in parts])
 
 
 def _find_icpx() -> str | None:
-    """Locate the icpx (SYCL) compiler needed for the -fsycl build."""
+    """Locate an icpx (SYCL) compiler new enough for the SYCL IPC memory build.
+
+    Compilers without the header are skipped: they build a device image that
+    torch's newer libsycl cannot load, aborting the process on dlopen rather
+    than raising something we could catch.
+    """
     candidates: list[str] = []
     root = os.getenv("CMPLR_ROOT")
     if root:
         candidates.append(os.path.join(root, "bin", "icpx"))
-    candidates += sorted(glob.glob("/opt/intel/oneapi/compiler/*/bin/icpx"), reverse=True)
-    for cand in candidates:
-        if os.path.exists(cand):
-            return cand
+    candidates += sorted(
+        glob.glob("/opt/intel/oneapi/compiler/*/bin/icpx"),
+        key=_icpx_version_key,
+        reverse=True,
+    )
     # Fallback to PATH: covers oneAPI layouts outside /opt and a sourced setvars.sh
     # that puts icpx on PATH without exporting CMPLR_ROOT.
-    return shutil.which("icpx")
+    which = shutil.which("icpx")
+    if which:
+        candidates.append(which)
+    return next(
+        (c for c in candidates if os.path.exists(c) and _has_ipc_memory(c)),
+        None,
+    )
 
 
 @functools.lru_cache(maxsize=1)
-def load_ext() -> ModuleType:
-    """JIT-compile (``-fsycl``, linking torch's libsycl) and cache the SYCL IPC extension.
+def load_ext() -> "ModuleType":
+    """JIT-compile (``with_sycl``, linking torch's libsycl) and cache the SYCL IPC extension.
 
     Raises on any failure; callers treat an exception as "XPU IPC unavailable".
     """
     icpx = _find_icpx()
     if icpx is None:
-        raise RuntimeError("icpx (oneAPI SYCL compiler) not found; cannot build XPU IPC extension")
-    icx = os.path.join(os.path.dirname(icpx), "icx")
+        raise RuntimeError(
+            "no icpx with SYCL ipc_memory support found (needs oneAPI >= 2026.0); "
+            "cannot build XPU IPC extension"
+        )
 
     from torch.utils.cpp_extension import load
 
     src = Path(__file__).with_name("sycl_ipc.cpp")
 
-    sycl_include_flags: list[str] = []
-    inc = _find_sycl_include_dir()
-    if inc:
-        sycl_include_flags = [f"-I{inc}", f"-I{os.path.join(inc, 'sycl')}"]
-
-    # torch.utils.cpp_extension picks the compiler from CC/CXX. Force icx/icpx for the
-    # -fsycl build: a conda/CI env often exports CXX=g++ (gxx_linux-64), which cannot
-    # compile -fsycl, and setdefault would keep it. Save/restore the process env.
-    prev_cc, prev_cxx = os.environ.get("CC"), os.environ.get("CXX")
-    if prev_cxx and os.path.realpath(prev_cxx) != os.path.realpath(icpx):
-        logger.debug(f"overriding CXX={prev_cxx!r} with icpx for the SYCL IPC build ({icpx})")
-    os.environ["CC"], os.environ["CXX"] = icx, icpx
+    # with_sycl=True supplies the SYCL include paths and device link, but torch invokes
+    # a bare "icpx", so it must be on PATH; keep -O2 or the host object is built -O0.
+    prev_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = os.path.dirname(icpx) + os.pathsep + prev_path
     try:
-        # Do NOT pin -std: torch.utils.cpp_extension injects the standard its ATen
-        # headers require, and a pin here would override it.
         module = load(
             name="checkpoint_engine_sycl_ipc",
             sources=[str(src)],
-            extra_cflags=["-fsycl", "-O2", *sycl_include_flags],
-            extra_ldflags=["-fsycl"],
+            extra_cflags=["-O2"],
+            with_sycl=True,
             verbose=False,
         )
     finally:
-        for var, prev in (("CC", prev_cc), ("CXX", prev_cxx)):
-            if prev is None:
-                os.environ.pop(var, None)
-            else:
-                os.environ[var] = prev
+        os.environ["PATH"] = prev_path
     return module
 
 
@@ -158,6 +156,6 @@ def close_handle(ptr: int) -> None:
     load_ext().ipc_close_handle(ptr)
 
 
-def wrap_tensor(ptr: int, nbytes: int, device: int) -> torch.Tensor:
+def wrap_tensor(ptr: int, nbytes: int, device: int) -> "torch.Tensor":
     """Wrap an IPC-mapped device pointer as a non-owning torch XPU uint8 tensor."""
     return load_ext().ipc_wrap_tensor(ptr, nbytes, device)

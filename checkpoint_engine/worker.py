@@ -8,24 +8,24 @@ import torch
 import zmq
 
 from checkpoint_engine.device_utils import DeviceManager, npu_generate_uuid
-from checkpoint_engine.transport import (
-    IpcWeightTransport,
-    WeightTransport,
-    XpuIpcWeightTransport,
+from checkpoint_engine.ipc_handler import (
+    IPCHandler,
+    TorchIPCHandler,
+    XpuIPCHandler,
 )
 
 
 _WEIGHTS_TYPE = list[tuple[str, torch.Tensor]]
 
 
-def _transport_for_handle(handle: object) -> WeightTransport:
-    """Pick the consumer-side transport based on the handle wire format.
+def _ipc_handler_for_handle(handle: object) -> IPCHandler:
+    """Pick the consumer-side IPC handler based on the handle wire format.
 
     CUDA/NPU send a ``reduce_tensor`` tuple; XPU sends a dict tagged with its kind.
     """
-    if isinstance(handle, dict) and handle.get("kind") == XpuIpcWeightTransport.kind:
-        return XpuIpcWeightTransport()
-    return IpcWeightTransport()
+    if isinstance(handle, dict) and handle.get("kind") == XpuIPCHandler.kind:
+        return XpuIPCHandler()
+    return TorchIPCHandler()
 
 
 class FlattenedTensorMetadata(TypedDict):
@@ -63,11 +63,11 @@ def update_weights_from_ipc(
     socket.connect(zmq_handle)
     buffer: torch.Tensor | None = None
     device_manager = DeviceManager()
-    transport: WeightTransport | None = None
+    ipc_handler: IPCHandler | None = None
     try:
         ipc_handle = socket.recv_pyobj()
-        transport = _transport_for_handle(ipc_handle)
-        buffer = transport.attach(ipc_handle, device_id)
+        ipc_handler = _ipc_handler_for_handle(ipc_handle)
+        buffer = ipc_handler.attach(ipc_handle, device_id)
         assert buffer.dtype == torch.uint8
         socket.send(b"")
     except Exception as e:
@@ -96,8 +96,8 @@ def update_weights_from_ipc(
                 device_manager.device_module.synchronize()
                 released = True
                 buffer = None
-                if transport is not None:
-                    transport.detach()
+                if ipc_handler is not None:
+                    ipc_handler.detach()
 
                 gc.collect()
                 device_manager.ipc_collect()
@@ -125,8 +125,8 @@ def update_weights_from_ipc(
     finally:
         socket.close()
         del buffer
-        if transport is not None:
-            transport.detach()
+        if ipc_handler is not None:
+            ipc_handler.detach()
         gc.collect()
         device_manager.device_module.empty_cache()
 

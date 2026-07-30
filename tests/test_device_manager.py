@@ -58,10 +58,19 @@ def test_ipc_collect_present_is_called():
     assert called == [True]
 
 
-def test_ipc_collect_absent_is_noop():
-    # torch.xpu has no ipc_collect attribute; ipc_collect() must not raise.
+def test_ipc_collect_xpu_is_noop():
+    # SYCL frees on close_handle, so XPU has no handle cache to collect (and
+    # torch.xpu has no ipc_collect); it must be a no-op, not an error.
     dm = _make_manager("xpu", SimpleNamespace())
-    dm.ipc_collect()  # no attribute -> silent no-op
+    dm.ipc_collect()
+
+
+def test_ipc_collect_rejects_unsupported_device():
+    # An unsupported backend must fail loudly rather than silently skipping the
+    # collect, matching backend/transfer_engine_protocol/_setup_device_module.
+    dm = _make_manager("tpu", SimpleNamespace())
+    with pytest.raises(TypeError, match="not supported"):
+        dm.ipc_collect()
 
 
 @pytest.mark.parametrize(
@@ -135,7 +144,7 @@ def test_real_xpu_device_manager():
     # ipc_collect must be a harmless no-op (torch.xpu has no ipc_collect).
     dm.ipc_collect()
     # XPU has no torch-native device-tensor IPC, but checkpoint-engine ships its own
-    # native SYCL ipc_memory transport; supports_device_ipc() must agree with whether
+    # native SYCL IPC memory handler; supports_device_ipc() must agree with whether
     # that extension can actually be built/loaded in this environment.
     from checkpoint_engine import xpu_ipc
 

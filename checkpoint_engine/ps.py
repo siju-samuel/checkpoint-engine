@@ -23,9 +23,9 @@ from checkpoint_engine.data_types import (
     ParameterMeta,
 )
 from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
+from checkpoint_engine.ipc_handler import IPCHandler, build_ipc_handler
 from checkpoint_engine.p2p_store import P2PStore
 from checkpoint_engine.pin_memory import _ALIGN_SIZE, _register_checkpoint
-from checkpoint_engine.transport import build_transport
 
 
 if TYPE_CHECKING:
@@ -597,7 +597,10 @@ class ParameterServer:
                 self.init_process_group(timeout=timeout)
             # if ranks is None or [], it will use fully broadcast to update to all ranks
             ranks_group = dist.new_group(ranks) if ranks else None
-            self._update_per_bucket(checkpoint_name, req_func, ranks_group, ranks)
+            # `with` releases the exported IPC handle on every exit path, including a
+            # failure before the broadcast loop's own cleanup starts.
+            with build_ipc_handler(self.device_manager) as ipc_handler:
+                self._update_per_bucket(checkpoint_name, req_func, ipc_handler, ranks_group, ranks)
             self.store_based_barrier()
         except Exception as e:
             logger.exception(
@@ -749,6 +752,7 @@ class ParameterServer:
         self,
         checkpoint_name: str,
         req_func: Callable[[list[tuple[str, str]]], None],
+        ipc_handler: IPCHandler,
         ranks_group: dist.DistributedProcessGroup | None,
         ranks: list[int] | None = None,
     ):
@@ -826,124 +830,114 @@ class ParameterServer:
             self._p2p_store.register_named_tensors(
                 {p2p_ipc_buffer_name: buffer if disable_h2d_buffer else h2d_buffer}
             )
-        transport = build_transport(self.device_manager)
-        # Outer try guarantees the exported IPC handle is released even when export,
-        # the socket bind, or the first send below raises -- its finally does nothing
-        # but detach(). The collective barrier stays in the inner finally so an early
-        # single-rank failure here cannot deadlock peers that never reach the loop.
+        handle = ipc_handler.export(buffer)
+
+        buckets_by_receiver_rank: dict[int, list[H2DBucket]] = defaultdict(list)
+        max_len = 0
+        for receiver_rank, _, bucket in buckets:
+            buckets_by_receiver_rank[receiver_rank].append(bucket)
+            if len(buckets_by_receiver_rank[receiver_rank]) > max_len:
+                max_len = len(buckets_by_receiver_rank[receiver_rank])
+
+        socket, socket_paths = self._bind_zmq_socket()
+        req_thread = threading.Thread(
+            target=req_func,
+            args=(socket_paths,),
+        )
+        req_thread.start()
+        # The handle is self-contained for every handler, so one ZMQ send completes the handoff.
+        socket.send_pyobj(handle)
+
+        gidx = 0
+        ret_code = torch.zeros((), device=self.device_manager.device_type, dtype=torch.int64)
+        buffer_b: torch.Tensor | None = None
         try:
-            handle = transport.export(buffer)
-
-            buckets_by_receiver_rank: dict[int, list[H2DBucket]] = defaultdict(list)
-            max_len = 0
-            for receiver_rank, _, bucket in buckets:
-                buckets_by_receiver_rank[receiver_rank].append(bucket)
-                if len(buckets_by_receiver_rank[receiver_rank]) > max_len:
-                    max_len = len(buckets_by_receiver_rank[receiver_rank])
-
-            socket, socket_paths = self._bind_zmq_socket()
-            req_thread = threading.Thread(
-                target=req_func,
-                args=(socket_paths,),
-            )
-            req_thread.start()
-            # The handle is self-contained for every transport, so one ZMQ send completes the handoff.
-            socket.send_pyobj(handle)
-
-            gidx = 0
-            ret_code = torch.zeros((), device=self.device_manager.device_type, dtype=torch.int64)
-            buffer_b: torch.Tensor | None = None
-            try:
-                for i in range(max_len):
-                    if i < len(receiver_rank_buckets) and not disable_h2d_buffer:
-                        self._copy_to_buffer(
-                            checkpoint_name,
-                            receiver_rank_buckets[i][1],
-                            h2d_buffer,
-                            receiver_rank_buckets[i][0] if ranks else None,
-                        )
-                    for receiver_rank, _buckets in buckets_by_receiver_rank.items():
-                        if i >= len(_buckets):
-                            continue
-                        bucket = _buckets[i]
-                        alloc, reserved = (
-                            self.device_manager.device_module.memory_allocated() / 1024 / 1024,
-                            self.device_manager.device_module.memory_reserved() / 1024 / 1024,
-                        )
-                        self._logger_rank0(
-                            f"[rank{self._rank}] begin to update bucket {gidx + 1}/{len(buckets)} receiver_rank {receiver_rank} in checkpoint {checkpoint_name}, bucket_size: {bucket.size / 1024 / 1024:.2f}MiB, length: {len(bucket.items)}. "
-                            f"Current device allocated {alloc:.2f} MB, "
-                            f"reserved {reserved:.2f} MB."
-                        )
-                        start = gidx % 2 * bucket_size
-                        buffer_b: torch.Tensor = buffer[start : start + bucket.size]
-                        if receiver_rank == self._rank:
-                            if disable_h2d_buffer:
-                                if p2p_update:
-                                    assert bucket == receiver_rank_buckets[i][1]
-                                self._copy_to_buffer(
-                                    checkpoint_name,
-                                    bucket,
-                                    buffer_b,
-                                    receiver_rank_buckets[i][0] if p2p_update else None,
-                                )
-                            else:
-                                buffer_b.data.copy_(h2d_buffer[: bucket.size])
-                        dist.broadcast(buffer_b, src=receiver_rank, group=ranks_group)
-                        resp = socket.recv()
-                        if resp != b"":
-                            msg = resp.decode("utf-8")
-                            logger.error(
-                                f"[rank{self._rank}] receive error response from rank {receiver_rank} for bucket {gidx} in checkpoint {checkpoint_name}: {msg}"
+            for i in range(max_len):
+                if i < len(receiver_rank_buckets) and not disable_h2d_buffer:
+                    self._copy_to_buffer(
+                        checkpoint_name,
+                        receiver_rank_buckets[i][1],
+                        h2d_buffer,
+                        receiver_rank_buckets[i][0] if ranks else None,
+                    )
+                for receiver_rank, _buckets in buckets_by_receiver_rank.items():
+                    if i >= len(_buckets):
+                        continue
+                    bucket = _buckets[i]
+                    alloc, reserved = (
+                        self.device_manager.device_module.memory_allocated() / 1024 / 1024,
+                        self.device_manager.device_module.memory_reserved() / 1024 / 1024,
+                    )
+                    self._logger_rank0(
+                        f"[rank{self._rank}] begin to update bucket {gidx + 1}/{len(buckets)} receiver_rank {receiver_rank} in checkpoint {checkpoint_name}, bucket_size: {bucket.size / 1024 / 1024:.2f}MiB, length: {len(bucket.items)}. "
+                        f"Current device allocated {alloc:.2f} MB, "
+                        f"reserved {reserved:.2f} MB."
+                    )
+                    start = gidx % 2 * bucket_size
+                    buffer_b: torch.Tensor = buffer[start : start + bucket.size]
+                    if receiver_rank == self._rank:
+                        if disable_h2d_buffer:
+                            if p2p_update:
+                                assert bucket == receiver_rank_buckets[i][1]
+                            self._copy_to_buffer(
+                                checkpoint_name,
+                                bucket,
+                                buffer_b,
+                                receiver_rank_buckets[i][0] if p2p_update else None,
                             )
-                            ret_code.fill_(1)
-                        dist.all_reduce(
-                            ret_code, op=torch.distributed.ReduceOp.SUM, group=ranks_group
+                        else:
+                            buffer_b.data.copy_(h2d_buffer[: bucket.size])
+                    dist.broadcast(buffer_b, src=receiver_rank, group=ranks_group)
+                    resp = socket.recv()
+                    if resp != b"":
+                        msg = resp.decode("utf-8")
+                        logger.error(
+                            f"[rank{self._rank}] receive error response from rank {receiver_rank} for bucket {gidx} in checkpoint {checkpoint_name}: {msg}"
                         )
-                        self.device_manager.device_module.synchronize()
-                        if ret_code.item() != 0:
-                            # quit early if any rank failed
-                            socket.send_pyobj(RuntimeError("Some workers failed to update weights"))
-                            raise RuntimeError("Failed to update weights due to remote errors")
-                        socket.send_pyobj(_to_named_tensor(bucket.items, gidx % 2 * bucket_size))
-                        gidx += 1
+                        ret_code.fill_(1)
+                    dist.all_reduce(ret_code, op=torch.distributed.ReduceOp.SUM, group=ranks_group)
+                    self.device_manager.device_module.synchronize()
+                    if ret_code.item() != 0:
+                        # quit early if any rank failed
+                        socket.send_pyobj(RuntimeError("Some workers failed to update weights"))
+                        raise RuntimeError("Failed to update weights due to remote errors")
+                    socket.send_pyobj(_to_named_tensor(bucket.items, gidx % 2 * bucket_size))
+                    gidx += 1
 
-                socket.recv()
-                device_mem = self.device_manager.device_module.mem_get_info()
-                logger.info(
-                    f"[rank{self._rank}] weights broadcast done, device mem usage: {(device_mem[1] - device_mem[0]) / 1024 / 1024:.2f} MB, allocated memory: {self.device_manager.device_module.memory_allocated() / 1024 / 1024:.2f} MB, reserved memory: {self.device_manager.device_module.memory_reserved() / 1024 / 1024:.2f} MB"
-                )
-                # Notify worker to release handle
-                socket.send_pyobj(None)
-                socket.recv()
-                # Set to None in correct order (views first, then base tensors)
-                del buffer_b, h2d_buffer, buffer, handle
-                self.device_manager.device_module.synchronize()
-                gc.collect()
-                self.device_manager.ipc_collect()
-                self.device_manager.device_module.empty_cache()
-                self.device_manager.device_module.synchronize()
+            socket.recv()
+            device_mem = self.device_manager.device_module.mem_get_info()
+            logger.info(
+                f"[rank{self._rank}] weights broadcast done, device mem usage: {(device_mem[1] - device_mem[0]) / 1024 / 1024:.2f} MB, allocated memory: {self.device_manager.device_module.memory_allocated() / 1024 / 1024:.2f} MB, reserved memory: {self.device_manager.device_module.memory_reserved() / 1024 / 1024:.2f} MB"
+            )
+            # Notify worker to release handle
+            socket.send_pyobj(None)
+            socket.recv()
+            # Set to None in correct order (views first, then base tensors)
+            del buffer_b, h2d_buffer, buffer, handle
+            self.device_manager.device_module.synchronize()
+            gc.collect()
+            self.device_manager.ipc_collect()
+            self.device_manager.device_module.empty_cache()
+            self.device_manager.device_module.synchronize()
 
-                # Log actual memory usage
-                device_mem = self.device_manager.device_module.mem_get_info()
-                logger.info(
-                    f"[rank{self._rank}] post-release: device mem usage: {(device_mem[1] - device_mem[0]) / 1024 / 1024:.2f} MB, "
-                    f"allocated: {self.device_manager.device_module.memory_allocated() / 1024 / 1024:.2f} MB, "
-                    f"reserved: {self.device_manager.device_module.memory_reserved() / 1024 / 1024:.2f} MB"
-                )
-                # Notify worker to call post_hook
-                socket.send_pyobj(None)
-                socket.recv()
-            finally:
-                req_thread.join()
-                dist.barrier(group=ranks_group)
-                socket.close()
-                if p2p_update:
-                    self._p2p_store.unregister_named_tensors([p2p_ipc_buffer_name])
-
-                self.device_manager.device_module.empty_cache()
+            # Log actual memory usage
+            device_mem = self.device_manager.device_module.mem_get_info()
+            logger.info(
+                f"[rank{self._rank}] post-release: device mem usage: {(device_mem[1] - device_mem[0]) / 1024 / 1024:.2f} MB, "
+                f"allocated: {self.device_manager.device_module.memory_allocated() / 1024 / 1024:.2f} MB, "
+                f"reserved: {self.device_manager.device_module.memory_reserved() / 1024 / 1024:.2f} MB"
+            )
+            # Notify worker to call post_hook
+            socket.send_pyobj(None)
+            socket.recv()
         finally:
-            transport.detach()
+            req_thread.join()
+            dist.barrier(group=ranks_group)
+            socket.close()
+            if p2p_update:
+                self._p2p_store.unregister_named_tensors([p2p_ipc_buffer_name])
+
+            self.device_manager.device_module.empty_cache()
 
 
 # we need this CLI entry point for compatibility with former versions

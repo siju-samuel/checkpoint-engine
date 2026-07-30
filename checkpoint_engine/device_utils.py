@@ -273,10 +273,14 @@ class DeviceManager:
             raise TypeError("The current transfer engine protocol is not supported")
 
     def ipc_collect(self) -> None:
-        """Reclaim memory held by stale IPC handles where the backend supports it (no-op otherwise)."""
-        fn = getattr(self.device_module, "ipc_collect", None)
-        if callable(fn):
-            fn()
+        """Reclaim memory held by stale IPC handles."""
+        if self.device_type in ("cuda", "npu"):
+            self.device_module.ipc_collect()
+        elif self.device_type == "xpu":
+            # SYCL ipc_memory frees on close_handle; there is no cache to collect.
+            pass
+        else:
+            raise TypeError("The current device type is not supported")
 
     def supports_inplace_pin(self) -> bool:
         """Whether in-place host-memory pinning (cudaHostRegister) is available -- CUDA only."""

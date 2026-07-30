@@ -1,4 +1,4 @@
-"""Hardware-gated tests for the native SYCL ipc_memory transport on Intel XPU.
+"""Hardware-gated tests for the native SYCL IPC memory handler on Intel XPU.
 
 These are skipped unless an Intel GPU is present and the SYCL IPC extension can
 be built (needs an oneAPI ``icpx`` with SYCL ipc_memory support). They are marked
@@ -119,7 +119,7 @@ def test_sycl_ipc_interior_pointer_offset_preserved():
 
 @skip_no_xpu_ipc
 def test_sycl_ipc_cross_process_broadcast():
-    """Full ParameterServer broadcast -> colocated worker over the XPU SYCL transport."""
+    """Full ParameterServer broadcast -> colocated worker over the XPU SYCL handler."""
     from torch.multiprocessing import get_context
 
     os.environ.setdefault("RANK", "0")

@@ -12,6 +12,7 @@ CI (``-m "not gpu"``).
 """
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -51,42 +52,54 @@ def test_open_handle_passes_bytes_and_device_through():
 
 
 # ------------------------------------------------------------------------------
-# load_ext: the -fsycl build must force CC/CXX to icx/icpx (a conda/CI env often
-# exports CXX=g++, which cannot compile -fsycl) and restore the env afterwards.
+# load_ext: with_sycl=True makes torch shell out to a bare "icpx", so the located
+# compiler must be on PATH for the build and PATH restored afterwards.
 # ------------------------------------------------------------------------------
 
 
-def test_load_ext_forces_icpx_over_existing_gpp_and_restores_env(
+def test_load_ext_puts_icpx_on_path_and_restores_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CXX", "/usr/bin/g++")  # what conda gxx_linux-64 exports
-    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
 
-    captured: dict[str, str | None] = {}
+    captured: dict[str, object] = {}
 
     def fake_load(**kwargs: object) -> MagicMock:
         # Record what torch.utils.cpp_extension.load would see.
-        captured["CC"] = os.environ.get("CC")
-        captured["CXX"] = os.environ.get("CXX")
+        captured["PATH"] = os.environ.get("PATH")
+        captured["kwargs"] = kwargs
         return MagicMock()
 
     xpu_ipc.load_ext.cache_clear()
     try:
         with (
             patch("checkpoint_engine.xpu_ipc._find_icpx", return_value="/opt/oneapi/bin/icpx"),
-            patch("checkpoint_engine.xpu_ipc._find_sycl_include_dir", return_value=None),
             patch("torch.utils.cpp_extension.load", side_effect=fake_load),
         ):
             xpu_ipc.load_ext()
     finally:
         xpu_ipc.load_ext.cache_clear()
 
-    # During the build the SYCL compiler must win over the inherited g++.
-    assert captured["CXX"] == "/opt/oneapi/bin/icpx"
-    assert captured["CC"] == "/opt/oneapi/bin/icx"
+    # torch runs `icpx --version`, so its directory must lead PATH during the build.
+    assert captured["PATH"] == "/opt/oneapi/bin:/usr/bin"
+    # The SYCL toolchain comes from with_sycl; -O2 must stay or the host object is -O0.
+    kwargs = captured["kwargs"]
+    assert kwargs["with_sycl"] is True
+    assert kwargs["extra_cflags"] == ["-O2"]
     # ...and the caller's environment must be restored afterwards.
-    assert os.environ["CXX"] == "/usr/bin/g++"
-    assert "CC" not in os.environ
+    assert os.environ["PATH"] == "/usr/bin"
+
+
+def test_icpx_version_key_orders_numerically() -> None:
+    # Lexicographic sort would rank 2026.9 above 2026.10; the key must compare
+    # version parts as numbers so the newest install really wins.
+    paths = [f"/opt/intel/oneapi/compiler/{v}/bin/icpx" for v in ("2026.9", "2026.10", "2025.3")]
+    ordered = sorted(paths, key=xpu_ipc._icpx_version_key, reverse=True)
+    assert [p.split("/")[-3] for p in ordered] == ["2026.10", "2026.9", "2025.3"]
+    # The non-numeric `latest` symlink points at the newest install, so it wins.
+    with_latest = [*paths, "/opt/intel/oneapi/compiler/latest/bin/icpx"]
+    best = max(with_latest, key=xpu_ipc._icpx_version_key)
+    assert best.split("/")[-3] == "latest"
 
 
 def test_find_icpx_falls_back_to_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,9 +110,39 @@ def test_find_icpx_falls_back_to_path(monkeypatch: pytest.MonkeyPatch) -> None:
     with (
         patch("checkpoint_engine.xpu_ipc.glob.glob", return_value=[]),
         patch("checkpoint_engine.xpu_ipc.shutil.which", return_value="/custom/bin/icpx") as which,
+        patch("checkpoint_engine.xpu_ipc.os.path.exists", return_value=True),
+        patch("checkpoint_engine.xpu_ipc._has_ipc_memory", return_value=True),
     ):
         assert xpu_ipc._find_icpx() == "/custom/bin/icpx"
     which.assert_called_once_with("icpx")
+
+
+def test_find_icpx_skips_compiler_without_ipc_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An icpx older than oneAPI 2026.0 builds a device image that torch's libsycl
+    # cannot load, aborting the process (SIGABRT) on dlopen -- uncatchable from
+    # Python. Such compilers must be rejected up front, before any build.
+    monkeypatch.setenv("CMPLR_ROOT", "/opt/intel/oneapi/compiler/2025.3")
+    with (
+        patch("checkpoint_engine.xpu_ipc.glob.glob", return_value=[]),
+        patch("checkpoint_engine.xpu_ipc.shutil.which", return_value=None),
+        patch("checkpoint_engine.xpu_ipc.os.path.exists", return_value=True),
+        patch("checkpoint_engine.xpu_ipc._has_ipc_memory", return_value=False),
+    ):
+        assert xpu_ipc._find_icpx() is None
+
+
+def test_has_ipc_memory_probes_the_header(tmp_path: Path) -> None:
+    # The discriminator is the header's presence in the compiler's own tree
+    # (<root>/bin/icpx -> <root>/include/sycl/.../ipc_memory.hpp).
+    icpx = tmp_path / "bin" / "icpx"
+    icpx.parent.mkdir(parents=True)
+    icpx.touch()
+    assert xpu_ipc._has_ipc_memory(str(icpx)) is False
+
+    header = tmp_path / "include" / "sycl" / "ext" / "oneapi" / "experimental" / "ipc_memory.hpp"
+    header.parent.mkdir(parents=True)
+    header.touch()
+    assert xpu_ipc._has_ipc_memory(str(icpx)) is True
 
 
 def test_is_available_caches_only_success_and_retries_failure(
@@ -156,43 +199,98 @@ def test_use_backend_none_keeps_default_torch_backend():
 
 
 # ------------------------------------------------------------------------------
-# _update_per_bucket: the exported IPC handle is retained until detach(). A
-# failure after export but before the broadcast loop (e.g. the ZMQ bind) must
-# still release it -- otherwise the exporter handle leaks on every failed update.
+# update(): the exported IPC handle is retained until detach(). A failure inside
+# _update_per_bucket must still release it -- otherwise the exporter handle leaks
+# on every failed weight update.
 # ------------------------------------------------------------------------------
 
 
-def test_update_per_bucket_detaches_transport_on_early_failure():
+def test_update_releases_ipc_handle_when_update_fails():
+    from checkpoint_engine.ipc_handler import IPCHandler
     from checkpoint_engine.ps import ParameterServer
+
+    # A real IPCHandler (not a MagicMock) so detach() must be reached through the
+    # context manager's __exit__ rather than by mocked attribute access.
+    class RecordingHandler(IPCHandler):
+        def __init__(self) -> None:
+            self.detached = 0
+
+        def export(self, buffer: object) -> dict:
+            return {"kind": "fake"}
+
+        def attach(self, handle: object, device_id: int) -> None:
+            raise AssertionError("attach is the consumer side; not used here")
+
+        def detach(self) -> None:
+            self.detached += 1
 
     ps = ParameterServer.__new__(ParameterServer)
     ps._rank = 0
+    ps._auto_pg = False
     ps.device_manager = SimpleNamespace(
         device_type="cpu",
-        supports_device_ipc=lambda: True,
-        supports_device_p2p=lambda: False,
+        device_module=SimpleNamespace(
+            empty_cache=lambda: None,
+            memory_allocated=lambda: 0,
+            memory_reserved=lambda: 0,
+        ),
     )
-    ps._current_global_parameter_metas = {0: object()}
-    ps._local_rdma_devices = None
-    ps._remote_rdma_devices = None
-
-    fake_transport = MagicMock()
-    fake_transport.export.return_value = {"kind": "fake"}
+    handler = RecordingHandler()
 
     with (
         patch.object(dist, "is_initialized", return_value=True),
-        patch("checkpoint_engine.ps.build_transport", return_value=fake_transport),
-        patch("checkpoint_engine.ps._gen_h2d_buckets", return_value=[]),
-        patch.object(ps, "_detect_bucket_size", return_value=(16, False)),
-        patch.object(ps, "_bind_zmq_socket", side_effect=RuntimeError("bind failed")),
-        pytest.raises(RuntimeError, match="bind failed"),
+        patch("checkpoint_engine.ps.build_ipc_handler", return_value=handler),
+        patch.object(
+            ps, "_update_per_bucket", side_effect=RuntimeError("update failed")
+        ) as per_bucket,
+        pytest.raises(RuntimeError, match="update failed"),
     ):
-        ps._update_per_bucket("ckpt", req_func=lambda _paths: None, ranks_group=None, ranks=None)
+        ps.update("ckpt", req_func=lambda _paths: None)
 
-    # export happened, so the exporter handle is live and must be released even
-    # though the failure struck before the broadcast loop's own cleanup.
-    fake_transport.export.assert_called_once()
-    fake_transport.detach.assert_called_once_with()
+    # The handler is handed to _update_per_bucket and released regardless of outcome.
+    assert handler in per_bucket.call_args.args
+    assert handler.detached == 1
+
+
+def test_update_releases_ipc_handle_on_success():
+    from checkpoint_engine.ipc_handler import IPCHandler
+    from checkpoint_engine.ps import ParameterServer
+
+    class RecordingHandler(IPCHandler):
+        def __init__(self) -> None:
+            self.detached = 0
+
+        def export(self, buffer: object) -> dict:
+            return {"kind": "fake"}
+
+        def attach(self, handle: object, device_id: int) -> None:
+            raise AssertionError("attach is the consumer side; not used here")
+
+        def detach(self) -> None:
+            self.detached += 1
+
+    ps = ParameterServer.__new__(ParameterServer)
+    ps._rank = 0
+    ps._auto_pg = False
+    ps.device_manager = SimpleNamespace(
+        device_type="cpu",
+        device_module=SimpleNamespace(
+            empty_cache=lambda: None,
+            memory_allocated=lambda: 0,
+            memory_reserved=lambda: 0,
+        ),
+    )
+    handler = RecordingHandler()
+
+    with (
+        patch.object(dist, "is_initialized", return_value=True),
+        patch("checkpoint_engine.ps.build_ipc_handler", return_value=handler),
+        patch.object(ps, "_update_per_bucket"),
+        patch.object(ps, "store_based_barrier"),
+    ):
+        ps.update("ckpt", req_func=lambda _paths: None)
+
+    assert handler.detached == 1
 
 
 def test_register_checkpoint_disables_inplace_pin_on_xpu():

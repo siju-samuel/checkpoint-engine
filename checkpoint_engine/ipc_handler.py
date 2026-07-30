@@ -1,14 +1,14 @@
-"""Pluggable device-buffer handoff between the ParameterServer and the worker.
+"""Pluggable IPC-handle exchange between the ParameterServer and the worker.
 
-The broadcast path shares a device buffer with the colocated worker. CUDA/NPU use
-:class:`IpcWeightTransport` (``torch.multiprocessing`` CUDA IPC, wire-format
-unchanged); XPU uses :class:`XpuIpcWeightTransport` (native SYCL ``ipc_memory``).
-The handle is always a picklable, self-contained value, so the producer's
-``export`` -> ZMQ ``send_pyobj`` -> consumer ``attach`` flow is identical for both;
-each side calls ``detach`` on cleanup.
+The broadcast path shares a device buffer with the colocated worker. Nothing here
+copies or moves the buffer: it only exchanges the IPC handle that lets the worker
+map the same device memory. CUDA/NPU use :class:`TorchIPCHandler`
+(``torch.multiprocessing`` CUDA IPC, wire-format unchanged); XPU uses
+:class:`XpuIPCHandler` (native SYCL ``ipc_memory``). The handle is always a
+picklable, self-contained value, so the producer's ``export`` -> ZMQ
+``send_pyobj`` -> consumer ``attach`` flow is identical for both; each side calls
+``detach`` on cleanup.
 """
-
-from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -21,10 +21,12 @@ from torch.multiprocessing.reductions import reduce_tensor
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from typing_extensions import Self
+
     from checkpoint_engine.device_utils import DeviceManager
 
 
-def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
+def _rebuild_ipc(handle: tuple["Callable", tuple], device_id: int | None = None) -> torch.Tensor:
     func, args = handle
     list_args = list(args)
     if device_id is not None:
@@ -34,8 +36,8 @@ def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -
     return func(*list_args)
 
 
-class WeightTransport(ABC):
-    """Hands a device buffer from the producer (ps) to the consumer (worker)."""
+class IPCHandler(ABC):
+    """Hands an IPC handle for a device buffer from the producer (ps) to the consumer (worker)."""
 
     @abstractmethod
     def export(self, buffer: torch.Tensor) -> Any:
@@ -48,8 +50,16 @@ class WeightTransport(ABC):
     def detach(self) -> None:
         """Release IPC resources on either side. No-op by default."""
 
+    # Used as a context manager so the handle is always released, without the
+    # caller needing its own try/finally.
+    def __enter__(self) -> "Self":
+        return self
 
-class IpcWeightTransport(WeightTransport):
+    def __exit__(self, *exc_info: object) -> None:
+        self.detach()
+
+
+class TorchIPCHandler(IPCHandler):
     """CUDA/NPU zero-copy handoff via torch.multiprocessing CUDA IPC (unchanged)."""
 
     def export(self, buffer: torch.Tensor) -> Any:
@@ -62,7 +72,7 @@ class IpcWeightTransport(WeightTransport):
         return buffer
 
 
-class XpuIpcWeightTransport(WeightTransport):
+class XpuIPCHandler(IPCHandler):
     """Intel XPU zero-copy handoff via native SYCL ``ipc_memory`` (portable byte blob)."""
 
     kind = "xpu_sycl"  # wire tag: identifies this handle format to the consumer
@@ -117,8 +127,8 @@ class XpuIpcWeightTransport(WeightTransport):
             self._exported_ptr = None
 
 
-def build_transport(device_manager: DeviceManager) -> WeightTransport:
-    """Select the weight transport for the current device backend."""
+def build_ipc_handler(device_manager: "DeviceManager") -> IPCHandler:
+    """Select the IPC handler for the current device backend."""
     if device_manager.device_type == "xpu":
-        return XpuIpcWeightTransport()
-    return IpcWeightTransport()
+        return XpuIPCHandler()
+    return TorchIPCHandler()

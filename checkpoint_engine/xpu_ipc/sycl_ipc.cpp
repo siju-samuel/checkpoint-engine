@@ -16,7 +16,15 @@
 #include <unordered_map>
 #include <vector>
 
+// Upstream split this API (functions -> ipc::memory, types -> parent ipc) and
+// deprecated flat ipc_memory; no oneAPI release ships it yet, so probe for it.
+#if __has_include(<sycl/ext/oneapi/experimental/detail/ipc_common.hpp>)
+namespace ipc = sycl::ext::oneapi::experimental::ipc::memory;
+namespace ipc_types = sycl::ext::oneapi::experimental::ipc;
+#else
 namespace ipc = sycl::ext::oneapi::experimental::ipc_memory;
+namespace ipc_types = sycl::ext::oneapi::experimental::ipc_memory;
+#endif
 
 namespace {
 
@@ -28,10 +36,10 @@ std::vector<std::byte> to_bytes(const std::vector<uint8_t>& in) {
 // Exporter-side handles kept alive until ipc_release_handle(). We must not
 // ipc::put() before the consumer opens: under the UR level-zero-v2 adapter
 // put_ipc_handle frees the exporter fd and can race the consumer's open.
-// ipc::handle is a copyable, non-owning value (freed only via ipc::put), so
+// The handle is a copyable, non-owning value (freed only via ipc::put), so
 // storing it by value needs no manual new/delete.
 std::mutex g_handles_mu;
-std::unordered_map<uintptr_t, ipc::handle> g_handles;
+std::unordered_map<uintptr_t, ipc_types::handle> g_handles;
 
 }  // namespace
 
@@ -39,8 +47,8 @@ std::unordered_map<uintptr_t, ipc::handle> g_handles;
 // are fine -- the offset is in the blob). Handle retained until ipc_release_handle().
 std::vector<uint8_t> ipc_get_handle(uintptr_t ptr) {
   sycl::context ctx = c10::xpu::get_device_context();
-  ipc::handle h = ipc::get(reinterpret_cast<void*>(ptr), ctx);
-  ipc::handle_data_t data = h.data();  // owning copy of the blob, independent of `h`
+  ipc_types::handle h = ipc::get(reinterpret_cast<void*>(ptr), ctx);
+  ipc_types::handle_data_t data = h.data();  // owning copy of the blob, independent of `h`
   {
     std::lock_guard<std::mutex> lk(g_handles_mu);
     auto it = g_handles.find(ptr);
@@ -58,7 +66,7 @@ std::vector<uint8_t> ipc_get_handle(uintptr_t ptr) {
 // Release the exporter handle from ipc_get_handle(ptr); no-op if unregistered.
 // Call only after all consumers have opened their mappings (see level-zero-v2 note).
 void ipc_release_handle(uintptr_t ptr) {
-  std::optional<ipc::handle> h;
+  std::optional<ipc_types::handle> h;
   {
     std::lock_guard<std::mutex> lk(g_handles_mu);
     auto it = g_handles.find(ptr);
